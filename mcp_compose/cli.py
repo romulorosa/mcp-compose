@@ -1,3 +1,6 @@
+# Copyright (c) 2025-2026 Datalayer, Inc.
+# Distributed under the terms of the Modified BSD License.
+
 """
 MCP Compose CLI.
 
@@ -8,9 +11,10 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .composer import ConflictResolution, MCPServerComposer
 from .config_loader import load_config, find_config_file
@@ -29,6 +33,69 @@ def setup_logging(verbose: bool = False) -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def setup_otel_tracing(service_name: str = "mcp-compose", out=sys.stderr) -> Optional[Any]:
+    """
+    Set up OpenTelemetry tracing for the mcp-compose server.
+    
+    Reads configuration from environment variables:
+        DATALAYER_LOGFIRE_TOKEN   - Logfire write token (required for tracing)
+        DATALAYER_LOGFIRE_PROJECT - Logfire project name (for display)
+        DATALAYER_LOGFIRE_URL     - Logfire URL (default: https://logfire-us.pydantic.dev)
+    
+    Args:
+        service_name: Name of the service for tracing
+        out: Output stream for status messages (stderr for STDIO mode)
+    
+    Returns:
+        TracerProvider if tracing is enabled, None otherwise
+    """
+    token = os.environ.get("DATALAYER_LOGFIRE_TOKEN")
+    if not token:
+        return None
+    
+    project = os.environ.get("DATALAYER_LOGFIRE_PROJECT", "starter-project")
+    url = os.environ.get("DATALAYER_LOGFIRE_URL", "https://logfire-us.pydantic.dev")
+    
+    try:
+        from .otel import setup_otel
+        
+        print(f"\n📊 OpenTelemetry tracing enabled", file=out)
+        print(f"   Endpoint: {url}/v1/traces", file=out)
+        
+        # Use the core setup_otel function
+        provider, tracer = setup_otel(
+            service_name=service_name,
+            token=token,
+            project=project,
+            url=url,
+            instrument=True,
+        )
+        
+        # Create a startup span
+        span = tracer.start_span('mcp-compose.server.startup')
+        span.set_attribute("service.name", service_name)
+        span.end()
+        
+        # Flush to send the startup span
+        provider.force_flush()
+        
+        print(f"   Traces: {url}/datalayer/{project}", file=out)
+        print(file=out)
+        
+        return provider
+        
+    except ImportError:
+        logger.debug("OpenTelemetry not available, tracing disabled")
+        return None
+    except ValueError as e:
+        # Token missing - already checked above, shouldn't happen
+        logger.debug(f"OTEL setup skipped: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to setup OpenTelemetry: {e}")
+        return None
 
 
 def compose_command(args: argparse.Namespace) -> int:
@@ -239,29 +306,41 @@ def serve_command(args: argparse.Namespace) -> int:
         # Find or use specified config file
         if args.config:
             config_path = Path(args.config)
+            print(f"Loading configuration from: {config_path}", file=sys.stderr)
+            config = load_config(config_path)
+            args.config_path = str(config_path)
         else:
             config_path = find_config_file()
             if config_path is None:
-                print("Error: No configuration file found.", file=sys.stderr)
-                print("Create mcp_compose.toml in current directory or use --config", file=sys.stderr)
-                return 1
-        
-        print(f"Loading configuration from: {config_path}", file=sys.stderr)
-        config = load_config(config_path)
-        args.config_path = str(config_path)
-        
+                # No config file found - start with empty config (no proxied servers)
+                print("No configuration file found. Starting without proxied MCP servers.", file=sys.stderr)
+                from .config import MCPComposerConfig
+                config = MCPComposerConfig()
+                args.config_path = None
+            else:
+                print(f"Loading configuration from: {config_path}", file=sys.stderr)
+                config = load_config(config_path)
+                args.config_path = str(config_path)
+
         # Run the server
-        return asyncio.run(run_server(config, args))
-        
+        code = asyncio.run(run_server(config, args))
+        logger.info("mcp-compose serve_command finished with code %d.", code)
+        raise SystemExit(code)
+
+    except SystemExit:
+        # Re-raise SystemExit as-is so callers receive it
+        raise
     except MCPComposerError as e:
+        logger.error("Configuration error: %s", e)
         print(f"Configuration error: {e}", file=sys.stderr)
-        return 1
+        raise SystemExit(1)
     except Exception as e:
+        logger.error("Unexpected error: %s", e)
         print(f"Unexpected error: {e}", file=sys.stderr)
         if args.verbose:
             import traceback
             traceback.print_exc()
-        return 1
+        raise SystemExit(1)
 
 
 async def run_server(config, args: argparse.Namespace) -> int:
@@ -288,6 +367,9 @@ async def run_server(config, args: argparse.Namespace) -> int:
     # In STDIO mode, all status output MUST go to stderr
     # Only JSON-RPC messages should go to stdout
     out = sys.stderr if transport_mode == "stdio" else sys.stdout
+    
+    # Setup OpenTelemetry tracing if configured via environment variables
+    otel_provider = setup_otel_tracing(service_name=config.composer.name, out=out)
     
     import uvicorn
     
@@ -385,7 +467,7 @@ async def run_server(config, args: argparse.Namespace) -> int:
     
     # Create discovery with config directory as project root for embedded server imports
     from .discovery import MCPServerDiscovery
-    config_dir = Path(args.config_path).parent
+    config_dir = Path(args.config_path).parent if args.config_path else Path.cwd()
     discovery = MCPServerDiscovery(project_root=config_dir)
     
     # Create composer
@@ -399,6 +481,7 @@ async def run_server(config, args: argparse.Namespace) -> int:
         composed_server_name=config.composer.name,
         conflict_resolution=conflict_strategy,
         discovery=discovery,
+        config=config,
         use_process_manager=True,
     )
     composer.process_manager = process_manager
@@ -426,9 +509,8 @@ async def run_server(config, args: argparse.Namespace) -> int:
                     config.servers.proxied.stdio)
         
         if not has_embedded and not has_stdio:
-            print("⚠️  No servers configured in mcp_compose.toml", file=out)
+            print("ℹ️  No proxied servers configured. Running with built-in tools only.", file=out)
             print(file=out)
-            return 1
         
         # Handle embedded servers using compose_from_config
         if has_embedded:
@@ -459,6 +541,7 @@ async def run_server(config, args: argparse.Namespace) -> int:
                         name=server_config.name,
                         command=command,
                         env=server_config.env,
+                        working_dir=server_config.working_dir,
                         auto_start=True
                     )
                     
@@ -473,6 +556,8 @@ async def run_server(config, args: argparse.Namespace) -> int:
             from .config import SseProxiedServerConfig
             from mcp import ClientSession
             from mcp.client.sse import sse_client
+            import subprocess
+            import time
             
             sse_servers = config.servers.proxied.sse
             
@@ -484,6 +569,28 @@ async def run_server(config, args: argparse.Namespace) -> int:
                     if isinstance(server_config, SseProxiedServerConfig):
                         print(f"  • {server_config.name}", file=out)
                         print(f"    URL: {server_config.url}", file=out)
+                        
+                        # Auto-start the server if configured
+                        if server_config.auto_start and server_config.command:
+                            print(f"    Auto-starting: {' '.join(server_config.command)}", file=out)
+                            try:
+                                env = dict(os.environ)
+                                env.update(server_config.env)
+                                process = subprocess.Popen(
+                                    server_config.command,
+                                    env=env,
+                                    cwd=server_config.working_dir,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                )
+                                # Store process for cleanup
+                                composer.processes[server_config.name] = process
+                                # Wait for server to start
+                                time.sleep(server_config.startup_delay)
+                                print(f"    Process started (PID: {process.pid})", file=out)
+                            except Exception as e:
+                                logger.error(f"Failed to auto-start SSE server {server_config.name}: {e}")
+                                print(f"    Auto-start failed: {e}", file=out)
                         
                         # Try to discover tools from the SSE server using MCP protocol
                         try:
@@ -549,6 +656,7 @@ async def run_server(config, args: argparse.Namespace) -> int:
                                     
                                     # Register with FastMCP using the tool decorator
                                     from mcp.server.fastmcp.tools.base import Tool
+                                    from .tool_proxy import fix_tool_argument_model
                                     tool_obj = Tool.from_function(
                                         proxy_func,
                                         name=tool_name,
@@ -558,6 +666,8 @@ async def run_server(config, args: argparse.Namespace) -> int:
                                     # Override inputSchema with the actual schema from remote tool
                                     if input_schema:
                                         tool_obj.parameters = input_schema
+                                        # Fix the argument model to preserve array/object types
+                                        fix_tool_argument_model(tool_obj, input_schema)
                                     
                                     # Add to composer
                                     composer.composed_tools[tool_name] = tool_def
@@ -593,7 +703,7 @@ async def run_server(config, args: argparse.Namespace) -> int:
         
         # Handle HTTP streaming proxied servers
         if hasattr(config, 'servers') and hasattr(config.servers, 'proxied') and hasattr(config.servers.proxied, 'http'):
-            from .config import HttpProxiedServerConfig
+            from .config import HttpProxiedServerConfig, HttpStreamProtocol
             from mcp import ClientSession
             from .transport.http_stream import create_http_stream_transport
             
@@ -607,112 +717,403 @@ async def run_server(config, args: argparse.Namespace) -> int:
                     if isinstance(server_config, HttpProxiedServerConfig):
                         print(f"  • {server_config.name}", file=out)
                         print(f"    URL: {server_config.url}", file=out)
-                        print(f"    Protocol: {server_config.protocol}", file=out)
+                        print(f"    Protocol: {server_config.protocol.value if hasattr(server_config.protocol, 'value') else server_config.protocol}", file=out)
                         
                         # Try to discover tools from the HTTP server using MCP protocol
                         try:
-                            # Connect to HTTP server using custom transport
-                            transport = await create_http_stream_transport(
-                                name=server_config.name,
-                                url=server_config.url,
-                                protocol=server_config.protocol,
-                                auth_token=server_config.auth_token,
-                                auth_type=server_config.auth_type,
-                                timeout=server_config.timeout,
-                                retry_interval=server_config.retry_interval,
-                                keep_alive=server_config.keep_alive,
-                                reconnect_on_failure=server_config.reconnect_on_failure,
-                                max_reconnect_attempts=server_config.max_reconnect_attempts,
-                                poll_interval=server_config.poll_interval,
-                            )
+                            # Check if using native MCP Streamable HTTP protocol
+                            protocol_value = server_config.protocol.value if hasattr(server_config.protocol, 'value') else str(server_config.protocol)
                             
-                            # Create MCP session with HTTP transport
-                            async with ClientSession(transport.messages(), transport.send) as session:
-                                # Initialize the session
-                                await session.initialize()
+                            if protocol_value == "streamable-http":
+                                # Use native MCP streamablehttp_client
+                                from mcp.client.streamable_http import streamablehttp_client
                                 
-                                # List tools using MCP protocol
-                                tools_result = await session.list_tools()
-                                tools = tools_result.tools
+                                # Build headers for authentication
+                                headers = {}
+                                if server_config.auth_token:
+                                    if server_config.auth_type.lower() == "bearer":
+                                        headers["Authorization"] = f"Bearer {server_config.auth_token}"
+                                    elif server_config.auth_type.lower() == "basic":
+                                        headers["Authorization"] = f"Basic {server_config.auth_token}"
+                                    else:
+                                        headers["Authorization"] = server_config.auth_token
                                 
-                                # Register tools in composer
-                                for tool in tools:
-                                    tool_name = f"{server_config.name}_{tool.name}"
-                                    
-                                    # Extract input schema
-                                    input_schema = {}
-                                    if hasattr(tool, 'inputSchema') and tool.inputSchema:
-                                        input_schema = tool.inputSchema
-                                    
-                                    tool_def = {
-                                        'name': tool.name,
-                                        'description': tool.description if hasattr(tool, 'description') else '',
-                                        'inputSchema': input_schema,
-                                    }
-                                    
-                                    # Create a proxy function for this HTTP tool
-                                    def make_http_proxy(http_config, original_tool_name: str):
-                                        """Create a proxy function that calls the remote HTTP server."""
-                                        async def http_tool_proxy(**kwargs):
-                                            """Proxy function for HTTP tool."""
-                                            from mcp import ClientSession
-                                            from .transport.http_stream import create_http_stream_transport
+                                async with streamablehttp_client(
+                                    url=server_config.url,
+                                    headers=headers if headers else None,
+                                    timeout=float(server_config.timeout),
+                                ) as (read_stream, write_stream, get_session_id):
+                                    async with ClientSession(read_stream, write_stream) as session:
+                                        # Initialize the session
+                                        await session.initialize()
+                                        
+                                        # List tools using MCP protocol
+                                        tools_result = await session.list_tools()
+                                        tools = tools_result.tools
+                                        
+                                        # Register tools in composer
+                                        for tool in tools:
+                                            tool_name = f"{server_config.name}_{tool.name}"
                                             
-                                            # Connect to HTTP server and call the tool
-                                            transport = await create_http_stream_transport(
-                                                name=http_config.name,
-                                                url=http_config.url,
-                                                protocol=http_config.protocol,
-                                                auth_token=http_config.auth_token,
-                                                auth_type=http_config.auth_type,
-                                                timeout=http_config.timeout,
+                                            # Extract input schema
+                                            input_schema = {}
+                                            if hasattr(tool, 'inputSchema') and tool.inputSchema:
+                                                input_schema = tool.inputSchema
+                                            
+                                            tool_def = {
+                                                'name': tool.name,
+                                                'description': tool.description if hasattr(tool, 'description') else '',
+                                                'inputSchema': input_schema,
+                                            }
+                                            
+                                            # Create a proxy function for this streamable HTTP tool
+                                            def make_streamable_http_proxy(http_config, original_tool_name: str, tool_description: str):
+                                                """Create a proxy function that calls the remote streamable HTTP server."""
+                                                async def streamable_http_tool_proxy(**kwargs):
+                                                    """Proxy function for streamable HTTP tool."""
+                                                    from mcp import ClientSession
+                                                    from mcp.client.streamable_http import streamablehttp_client
+                                                    
+                                                    # Build headers for authentication
+                                                    hdrs = {}
+                                                    if http_config.auth_token:
+                                                        if http_config.auth_type.lower() == "bearer":
+                                                            hdrs["Authorization"] = f"Bearer {http_config.auth_token}"
+                                                        elif http_config.auth_type.lower() == "basic":
+                                                            hdrs["Authorization"] = f"Basic {http_config.auth_token}"
+                                                        else:
+                                                            hdrs["Authorization"] = http_config.auth_token
+                                                    
+                                                    async with streamablehttp_client(
+                                                        url=http_config.url,
+                                                        headers=hdrs if hdrs else None,
+                                                        timeout=float(http_config.timeout),
+                                                    ) as (read_stream, write_stream, get_session_id):
+                                                        async with ClientSession(read_stream, write_stream) as session:
+                                                            await session.initialize()
+                                                            result = await session.call_tool(original_tool_name, kwargs)
+                                                            # Extract text content from MCP response
+                                                            if hasattr(result, 'content') and result.content:
+                                                                for content_item in result.content:
+                                                                    if hasattr(content_item, 'text'):
+                                                                        return content_item.text
+                                                            return str(result)
+                                                
+                                                streamable_http_tool_proxy.__name__ = tool_name.replace("-", "_")
+                                                streamable_http_tool_proxy.__doc__ = tool_description
+                                                return streamable_http_tool_proxy
+                                            
+                                            # Create the proxy function
+                                            proxy_func = make_streamable_http_proxy(server_config, tool.name, tool_def['description'])
+                                            
+                                            # Register with FastMCP using the tool decorator
+                                            from mcp.server.fastmcp.tools.base import Tool
+                                            from .tool_proxy import fix_tool_argument_model
+                                            tool_obj = Tool.from_function(
+                                                proxy_func,
+                                                name=tool_name,
+                                                description=tool_def['description']
                                             )
                                             
-                                            try:
-                                                async with ClientSession(transport.messages(), transport.send) as session:
-                                                    await session.initialize()
-                                                    result = await session.call_tool(original_tool_name, kwargs)
-                                                    # Extract text content from MCP response
-                                                    if hasattr(result, 'content') and result.content:
-                                                        for content_item in result.content:
-                                                            if hasattr(content_item, 'text'):
-                                                                return content_item.text
-                                                    return str(result)
-                                            finally:
-                                                await transport.disconnect()
+                                            # Override inputSchema with the actual schema from remote tool
+                                            if input_schema:
+                                                tool_obj.parameters = input_schema
+                                                # Fix the argument model to preserve array/object types
+                                                fix_tool_argument_model(tool_obj, input_schema)
+                                            
+                                            # Add to composer
+                                            composer.composed_tools[tool_name] = tool_def
+                                            composer.composed_server._tool_manager._tools[tool_name] = tool_obj
+                                            composer.source_mapping[tool_name] = server_config.name
                                         
-                                        http_tool_proxy.__name__ = tool_name.replace("-", "_")
-                                        http_tool_proxy.__doc__ = tool_def['description']
-                                        return http_tool_proxy
-                                    
-                                    # Create the proxy function
-                                    proxy_func = make_http_proxy(server_config, tool.name)
-                                    
-                                    # Register with FastMCP using the tool decorator
-                                    from mcp.server.fastmcp.tools.base import Tool
-                                    tool_obj = Tool.from_function(
-                                        proxy_func,
-                                        name=tool_name,
-                                        description=tool_def['description']
-                                    )
-                                    
-                                    # Override inputSchema with the actual schema from remote tool
-                                    if input_schema:
-                                        tool_obj.parameters = input_schema
-                                    
-                                    # Add to composer
-                                    composer.composed_tools[tool_name] = tool_def
-                                    composer.composed_server._tool_manager._tools[tool_name] = tool_obj
-                                    composer.source_mapping[tool_name] = server_config.name
+                                        print(f"    Tools: {len(tools)} discovered", file=out)
+                                        print(f"    Status: ✓ Connected", file=out)
+                            else:
+                                # Use custom HTTP stream transport for other protocols
+                                transport = await create_http_stream_transport(
+                                    name=server_config.name,
+                                    url=server_config.url,
+                                    protocol=server_config.protocol,
+                                    auth_token=server_config.auth_token,
+                                    auth_type=server_config.auth_type,
+                                    timeout=server_config.timeout,
+                                    retry_interval=server_config.retry_interval,
+                                    keep_alive=server_config.keep_alive,
+                                    reconnect_on_failure=server_config.reconnect_on_failure,
+                                    max_reconnect_attempts=server_config.max_reconnect_attempts,
+                                    poll_interval=server_config.poll_interval,
+                                )
                                 
-                                print(f"    Tools: {len(tools)} discovered", file=out)
-                                print(f"    Status: ✓ Connected", file=out)
-                                
-                            await transport.disconnect()
+                                # Create MCP session with HTTP transport
+                                async with ClientSession(transport.messages(), transport.send) as session:
+                                    # Initialize the session
+                                    await session.initialize()
+                                    
+                                    # List tools using MCP protocol
+                                    tools_result = await session.list_tools()
+                                    tools = tools_result.tools
+                                    
+                                    # Register tools in composer
+                                    for tool in tools:
+                                        tool_name = f"{server_config.name}_{tool.name}"
+                                        
+                                        # Extract input schema
+                                        input_schema = {}
+                                        if hasattr(tool, 'inputSchema') and tool.inputSchema:
+                                            input_schema = tool.inputSchema
+                                        
+                                        tool_def = {
+                                            'name': tool.name,
+                                            'description': tool.description if hasattr(tool, 'description') else '',
+                                            'inputSchema': input_schema,
+                                        }
+                                        
+                                        # Create a proxy function for this HTTP tool
+                                        def make_http_proxy(http_config, original_tool_name: str):
+                                            """Create a proxy function that calls the remote HTTP server."""
+                                            async def http_tool_proxy(**kwargs):
+                                                """Proxy function for HTTP tool."""
+                                                from mcp import ClientSession
+                                                from .transport.http_stream import create_http_stream_transport
+                                                
+                                                # Connect to HTTP server and call the tool
+                                                transport = await create_http_stream_transport(
+                                                    name=http_config.name,
+                                                    url=http_config.url,
+                                                    protocol=http_config.protocol,
+                                                    auth_token=http_config.auth_token,
+                                                    auth_type=http_config.auth_type,
+                                                    timeout=http_config.timeout,
+                                                )
+                                                
+                                                try:
+                                                    async with ClientSession(transport.messages(), transport.send) as session:
+                                                        await session.initialize()
+                                                        result = await session.call_tool(original_tool_name, kwargs)
+                                                        # Extract text content from MCP response
+                                                        if hasattr(result, 'content') and result.content:
+                                                            for content_item in result.content:
+                                                                if hasattr(content_item, 'text'):
+                                                                    return content_item.text
+                                                        return str(result)
+                                                finally:
+                                                    await transport.disconnect()
+                                            
+                                            http_tool_proxy.__name__ = tool_name.replace("-", "_")
+                                            http_tool_proxy.__doc__ = tool_def['description']
+                                            return http_tool_proxy
+                                        
+                                        # Create the proxy function
+                                        proxy_func = make_http_proxy(server_config, tool.name)
+                                        
+                                        # Register with FastMCP using the tool decorator
+                                        from mcp.server.fastmcp.tools.base import Tool
+                                        from .tool_proxy import fix_tool_argument_model
+                                        tool_obj = Tool.from_function(
+                                            proxy_func,
+                                            name=tool_name,
+                                            description=tool_def['description']
+                                        )
+                                        
+                                        # Override inputSchema with the actual schema from remote tool
+                                        if input_schema:
+                                            tool_obj.parameters = input_schema
+                                            # Fix the argument model to preserve array/object types
+                                            fix_tool_argument_model(tool_obj, input_schema)
+                                        
+                                        # Add to composer
+                                        composer.composed_tools[tool_name] = tool_def
+                                        composer.composed_server._tool_manager._tools[tool_name] = tool_obj
+                                        composer.source_mapping[tool_name] = server_config.name
+                                    
+                                    print(f"    Tools: {len(tools)} discovered", file=out)
+                                    print(f"    Status: ✓ Connected", file=out)
+                                    
+                                await transport.disconnect()
                             
                         except Exception as e:
                             logger.error(f"Failed to connect to HTTP server {server_config.name}: {e}")
                             print(f"    Status: ❌ Connection failed: {e}", file=out)
+                            # Print detailed traceback for debugging
+                            import traceback
+                            logger.debug(traceback.format_exc())
+                        
+                        print(file=out)
+        
+        # Connect to Streamable HTTP proxied servers
+        if hasattr(config, 'servers') and hasattr(config.servers, 'proxied') and hasattr(config.servers.proxied, 'streamable_http'):
+            from .config import StreamableHttpProxiedServerConfig
+            from mcp import ClientSession
+            from mcp.client.streamable_http import streamablehttp_client
+            import subprocess
+            import time
+            
+            streamable_http_servers = config.servers.proxied.streamable_http
+            
+            if streamable_http_servers:
+                print(f"Connecting to {len(streamable_http_servers)} Streamable HTTP server(s)...", file=out)
+                print(file=out)
+                
+                for server_config in streamable_http_servers:
+                    if isinstance(server_config, StreamableHttpProxiedServerConfig):
+                        print(f"  • {server_config.name}", file=out)
+                        print(f"    URL: {server_config.url}", file=out)
+                        
+                        # Auto-start the server if configured
+                        if server_config.auto_start and server_config.command:
+                            print(f"    Auto-starting: {' '.join(server_config.command)}", file=out)
+                            try:
+                                env = dict(os.environ)
+                                env.update(server_config.env)
+                                process = subprocess.Popen(
+                                    server_config.command,
+                                    env=env,
+                                    cwd=server_config.working_dir,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                )
+                                # Store process for cleanup
+                                composer.processes[server_config.name] = process
+                                # Wait for server to start
+                                time.sleep(server_config.startup_delay)
+                                print(f"    Process started (PID: {process.pid})", file=out)
+                            except Exception as e:
+                                logger.error(f"Failed to auto-start Streamable HTTP server {server_config.name}: {e}")
+                                print(f"    Auto-start failed: {e}", file=out)
+                        
+                        # Try to discover tools from the Streamable HTTP server using MCP protocol
+                        try:
+                            # Build headers for authentication
+                            headers = {}
+                            if server_config.auth_token:
+                                if server_config.auth_type.lower() == "bearer":
+                                    headers["Authorization"] = f"Bearer {server_config.auth_token}"
+                                elif server_config.auth_type.lower() == "basic":
+                                    headers["Authorization"] = f"Basic {server_config.auth_token}"
+                                else:
+                                    headers["Authorization"] = server_config.auth_token
+                            
+                            async with streamablehttp_client(
+                                url=server_config.url,
+                                headers=headers if headers else None,
+                                timeout=float(server_config.timeout),
+                            ) as (read_stream, write_stream, get_session_id):
+                                async with ClientSession(read_stream, write_stream) as session:
+                                    # Initialize the session
+                                    await session.initialize()
+                                    
+                                    # List tools using MCP protocol
+                                    tools_result = await session.list_tools()
+                                    tools = tools_result.tools
+                                    
+                                    # Store the number of tools before registration
+                                    tools_discovered = len(tools)
+                                    logger.info(f"Discovered {tools_discovered} tools from Streamable HTTP server {server_config.name}")
+                            
+                            # Register tools in composer (moved outside the ClientSession context)
+                            # This ensures tools are registered even if there's a cleanup issue
+                            if 'tools' in locals() and tools:
+                                logger.info(f"Registering {len(tools)} tools from Streamable HTTP server {server_config.name}")
+                                
+                                for tool in tools:
+                                        tool_name = f"{server_config.name}_{tool.name}"
+                                        
+                                        # Extract input schema
+                                        input_schema = {}
+                                        if hasattr(tool, 'inputSchema') and tool.inputSchema:
+                                            input_schema = tool.inputSchema
+                                        
+                                        tool_def = {
+                                            'name': tool.name,
+                                            'description': tool.description if hasattr(tool, 'description') else '',
+                                            'inputSchema': input_schema,
+                                        }
+                                        
+                                        # Create a proxy function for this streamable HTTP tool
+                                        def make_streamable_http_proxy(http_config, original_tool_name: str, tool_description: str):
+                                            """Create a proxy function that calls the remote streamable HTTP server."""
+                                            async def streamable_http_tool_proxy(**kwargs):
+                                                """Proxy function for streamable HTTP tool."""
+                                                from mcp import ClientSession
+                                                from mcp.client.streamable_http import streamablehttp_client
+                                                
+                                                # Build headers for authentication
+                                                hdrs = {}
+                                                if http_config.auth_token:
+                                                    if http_config.auth_type.lower() == "bearer":
+                                                        hdrs["Authorization"] = f"Bearer {http_config.auth_token}"
+                                                    elif http_config.auth_type.lower() == "basic":
+                                                        hdrs["Authorization"] = f"Basic {http_config.auth_token}"
+                                                    else:
+                                                        hdrs["Authorization"] = http_config.auth_token
+                                                
+                                                async with streamablehttp_client(
+                                                    url=http_config.url,
+                                                    headers=hdrs if hdrs else None,
+                                                    timeout=float(http_config.timeout),
+                                                ) as (read_stream, write_stream, get_session_id):
+                                                    async with ClientSession(read_stream, write_stream) as session:
+                                                        await session.initialize()
+                                                        result = await session.call_tool(original_tool_name, kwargs)
+                                                        # Extract text content from MCP response
+                                                        if hasattr(result, 'content') and result.content:
+                                                            for content_item in result.content:
+                                                                if hasattr(content_item, 'text'):
+                                                                    return content_item.text
+                                                        return str(result)
+                                            
+                                            streamable_http_tool_proxy.__name__ = tool_name.replace("-", "_")
+                                            streamable_http_tool_proxy.__doc__ = tool_description
+                                            return streamable_http_tool_proxy
+                                        
+                                        # Create the proxy function
+                                        proxy_func = make_streamable_http_proxy(server_config, tool.name, tool_def['description'])
+                                        
+                                        # Register with FastMCP using the tool decorator
+                                        from mcp.server.fastmcp.tools.base import Tool
+                                        from .tool_proxy import fix_tool_argument_model
+                                        tool_obj = Tool.from_function(
+                                            proxy_func,
+                                            name=tool_name,
+                                            description=tool_def['description']
+                                        )
+                                        
+                                        # Override inputSchema with the actual schema from remote tool
+                                        if input_schema:
+                                            tool_obj.parameters = input_schema
+                                            # Fix the argument model to preserve array/object types
+                                            fix_tool_argument_model(tool_obj, input_schema)
+                                        
+                                        # Add to composer
+                                        composer.composed_tools[tool_name] = tool_def
+                                        composer.composed_server._tool_manager._tools[tool_name] = tool_obj
+                                        composer.source_mapping[tool_name] = server_config.name
+                                
+                                logger.info(f"Successfully registered {len(tools)} tools from Streamable HTTP server {server_config.name}")
+                                print(f"    Tools: {len(tools)} registered", file=out)
+                                print(f"    Status: ✓ Connected", file=out)
+                            else:
+                                print(f"    Status: ❌ No tools discovered", file=out)
+                        except Exception as e:
+                            # Check if it's just a cleanup error (TaskGroup exception after successful operation)
+                            error_str = str(e)
+                            if "TaskGroup" in error_str and "sub-exception" in error_str:
+                                # This is a cleanup issue that happens after tools are registered
+                                # Check if tools were actually registered by looking at composer
+                                streamable_http_tools_count = sum(1 for name in composer.source_mapping if composer.source_mapping[name] == server_config.name)
+                                if streamable_http_tools_count > 0:
+                                    logger.warning(f"Streamable HTTP server {server_config.name} connected successfully ({streamable_http_tools_count} tools) but had cleanup issues: {e}")
+                                    print(f"    Tools: {streamable_http_tools_count} registered", file=out)
+                                    print(f"    Status: ✓ Connected (cleanup warning)", file=out)
+                                else:
+                                    logger.error(f"Streamable HTTP server {server_config.name} failed during tool registration: {e}")
+                                    print(f"    Status: ❌ Tool registration failed", file=out)
+                            else:
+                                logger.error(f"Failed to connect to Streamable HTTP server {server_config.name}: {e}")
+                                print(f"    Status: ❌ Connection failed: {e}", file=out)
+                                # Print detailed traceback for debugging
+                                import traceback
+                                logger.debug(traceback.format_exc())
                         
                         print(file=out)
         
@@ -757,11 +1158,29 @@ async def run_server(config, args: argparse.Namespace) -> int:
         # HTTP-based transport modes (streamable-http or sse)
         # Create the FastAPI REST API app
         from .api import create_app
-        from .api.dependencies import set_composer
+        from .api.dependencies import set_composer, set_config
         from contextlib import asynccontextmanager
         
-        # Set the composer instance for dependency injection
+        # Determine port priority: CLI arg (if explicitly set) > composer config > default
+        # Note: 8000 is the argparse default for serve command
+        if hasattr(args, 'port') and args.port != 8000:
+            # CLI arg was explicitly provided
+            server_port = args.port
+        elif config.composer and config.composer.port:
+            # Use composer config port
+            server_port = config.composer.port
+        else:
+            # Fall back to default
+            server_port = args.port
+        
+        # Determine UI port (for logging purposes)
+        ui_port = server_port  # Default: UI on same port as transport
+        if config.ui and config.ui.enabled and config.ui.port and config.ui.mode == "separate":
+            ui_port = config.ui.port
+        
+        # Set the composer and config instances for dependency injection
         set_composer(composer)
+        set_config(config)
         
         # For streamable-http, we need to run the session manager in the lifespan
         session_manager = None
@@ -882,7 +1301,7 @@ async def run_server(config, args: argparse.Namespace) -> int:
                 # Configure OAuth with server details
                 # Always use localhost for OAuth callback URLs (GitHub requires exact match)
                 oauth_host = "localhost" if args.host == "0.0.0.0" else args.host
-                server_url = f"http://{oauth_host}:{config.composer.port}"
+                server_url = f"http://{oauth_host}:{server_port}"
                 configure_oauth(
                     provider=oauth2_config.provider,
                     client_id=oauth2_config.client_id,
@@ -896,19 +1315,26 @@ async def run_server(config, args: argparse.Namespace) -> int:
                 
                 # Include OAuth routes
                 app.include_router(oauth_router)
-                print(f"  OAuth Callback: http://localhost:{config.composer.port}/oauth/callback", file=out)
-                print(f"  Authorize:      http://localhost:{config.composer.port}/authorize", file=out)
+                print(f"  OAuth Callback: http://localhost:{server_port}/oauth/callback", file=out)
+                print(f"  Authorize:      http://localhost:{server_port}/authorize", file=out)
         
         print("=" * 70, file=out)
         print(f"📡 MCP Server Mode: {transport_mode.upper()}", file=out)
         print("=" * 70, file=out)
         if transport_mode == "streamable-http":
-            print(f"  MCP Endpoint:  http://localhost:{config.composer.port}/mcp", file=out)
+            print(f"  MCP Endpoint:  http://localhost:{server_port}/mcp", file=out)
         else:
-            print(f"  SSE Endpoint:  http://localhost:{config.composer.port}/sse (deprecated)", file=out)
-        print(f"  Tools List:    http://localhost:{config.composer.port}/tools", file=out)
-        print(f"  REST API:      http://localhost:{config.composer.port}/api/v1", file=out)
-        print(f"  Health Check:  http://localhost:{config.composer.port}/api/v1/health", file=out)
+            print(f"  SSE Endpoint:  http://localhost:{server_port}/sse (deprecated)", file=out)
+        print(f"  Tools List:    http://localhost:{server_port}/tools", file=out)
+        print(f"  REST API:      http://localhost:{server_port}/api/v1", file=out)
+        print(f"  Health Check:  http://localhost:{server_port}/api/v1/health", file=out)
+        # Check if UI is available
+        from pathlib import Path as PathLib
+        ui_dist_path = PathLib(__file__).parent / "ui" / "dist"
+        if not ui_dist_path.exists():
+            ui_dist_path = PathLib(__file__).parent.parent / "ui" / "dist"
+        if ui_dist_path.exists() and ui_dist_path.is_dir():
+            print(f"  Web UI:        http://localhost:{ui_port}/ui", file=out)
         print(file=out)
         print(f"✓ Unified MCP server is now running!", file=out)
         print(f"  Total tools: {len(composer.composed_tools)}", file=out)
@@ -940,7 +1366,7 @@ async def run_server(config, args: argparse.Namespace) -> int:
         server_config_uvicorn = uvicorn.Config(
             app=app,
             host=args.host,
-            port=config.composer.port,
+            port=server_port,
             log_level="info",
         )
         server = uvicorn.Server(server_config_uvicorn)
@@ -957,6 +1383,11 @@ async def run_server(config, args: argparse.Namespace) -> int:
         # Clean shutdown
         await process_manager.stop()
         print("✓ All servers stopped", file=out)
+        
+        # Flush OTEL traces before exit
+        if otel_provider is not None:
+            otel_provider.force_flush()
+            print("✓ OpenTelemetry traces flushed", file=out)
 
 
 def create_parser() -> argparse.ArgumentParser:
