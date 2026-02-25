@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 Datalayer, Inc.
+# Distributed under the terms of the Modified BSD License.
+
 """
 MCP Server 1 - Calculator Tools
 
@@ -12,17 +15,17 @@ mcp = FastMCP("calculator-server")
 
 
 @mcp.tool()
-def add(a: float, b: float) -> float:
-    """Add two numbers together.
+def add(a: float, b: list[float]) -> float:
+    """Add a number to a list of numbers.
     
     Args:
         a: First number
-        b: Second number
+        b: List of numbers to add to a
         
     Returns:
-        Sum of a and b
+        Sum of a and all numbers in b
     """
-    return a + b
+    return a + sum(b)
 
 
 @mcp.tool()

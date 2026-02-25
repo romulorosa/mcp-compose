@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2025-2026 Datalayer, Inc.
+ * Distributed under the terms of the Modified BSD License.
+ */
+
 import axios from 'axios'
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '/api/v1'
@@ -30,7 +35,7 @@ apiClient.interceptors.response.use(
     if (error.response?.status === 401) {
       // Handle unauthorized
       localStorage.removeItem('auth_token')
-      window.location.href = '/login'
+      window.location.href = '/ui/login'
     }
     return Promise.reject(error)
   }
@@ -38,6 +43,12 @@ apiClient.interceptors.response.use(
 
 // API methods
 export const api = {
+  // Auth
+  login: (username: string, password: string) => 
+    apiClient.post('/auth/login', { username, password }),
+  logout: () => apiClient.post('/auth/logout'),
+  getCurrentUser: () => apiClient.get('/auth/me'),
+  
   // Health
   getHealth: () => apiClient.get('/health'),
   
@@ -55,7 +66,7 @@ export const api = {
     apiClient.get(`/servers/${id}/logs`, { params }),
   
   // Tools
-  listTools: (params?: { server_name?: string; page?: number; page_size?: number }) => 
+  listTools: (params?: { server_id?: string; offset?: number; limit?: number }) => 
     apiClient.get('/tools', { params }),
   getTool: (name: string) => apiClient.get(`/tools/${encodeURIComponent(name)}`),
   invokeTool: (name: string, arguments_: Record<string, unknown>) => 
@@ -106,6 +117,17 @@ export const api = {
   deleteTranslator: (name: string) => apiClient.delete(`/translators/${name}`),
   translateMessage: (name: string, message: unknown) => 
     apiClient.post(`/translators/${name}/translate`, message),
+  
+  // Settings
+  getSettings: () => apiClient.get('/settings'),
+  updateSettings: (settings: {
+    api_endpoint?: string
+    refresh_interval?: number
+    enable_notifications?: boolean
+    enable_sounds?: boolean
+    max_log_lines?: number
+  }) => apiClient.put('/settings', settings),
+  resetSettings: () => apiClient.post('/settings/reset'),
 }
 
 export default api

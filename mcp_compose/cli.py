@@ -321,7 +321,7 @@ def serve_command(args: argparse.Namespace) -> int:
                 print(f"Loading configuration from: {config_path}", file=sys.stderr)
                 config = load_config(config_path)
                 args.config_path = str(config_path)
-
+        
         # Run the server
         code = asyncio.run(run_server(config, args))
         logger.info("mcp-compose serve_command finished with code %d.", code)

@@ -1,3 +1,6 @@
+# Copyright (c) 2025-2026 Datalayer, Inc.
+# Distributed under the terms of the Modified BSD License.
+
 """
 MCP Compose Module.
 
@@ -73,6 +76,7 @@ class MCPServerComposer:
         self.composed_resources: Dict[str, Any] = {}
         self.source_mapping: Dict[str, str] = {}  # Maps component name to source server
         self.conflicts_resolved: List[Dict[str, Any]] = []
+        self.processes: Dict[str, Any] = {}  # Track auto-started processes for SSE/Streamable HTTP servers
         
         # Optional enhanced managers
         self.tool_manager: Optional[ToolManager] = None
@@ -567,13 +571,25 @@ class MCPServerComposer:
         """Get list of all composed tool names."""
         return list(self.composed_tools.keys())
 
+    def get_tool(self, tool_name: str) -> Optional[Dict[str, Any]]:
+        """Get tool definition by name."""
+        return self.composed_tools.get(tool_name)
+
     def list_prompts(self) -> List[str]:
         """Get list of all composed prompt names."""
         return list(self.composed_prompts.keys())
 
+    def get_prompt(self, prompt_name: str) -> Optional[Dict[str, Any]]:
+        """Get prompt definition by name."""
+        return self.composed_prompts.get(prompt_name)
+
     def list_resources(self) -> List[str]:
         """Get list of all composed resource names."""
         return list(self.composed_resources.keys())
+
+    def get_resource(self, resource_name: str) -> Optional[Dict[str, Any]]:
+        """Get resource definition by name."""
+        return self.composed_resources.get(resource_name)
 
     def get_tool_source(self, tool_name: str) -> Optional[str]:
         """Get the source server name for a specific tool."""

@@ -1,3 +1,6 @@
+# Copyright (c) 2025-2026 Datalayer, Inc.
+# Distributed under the terms of the Modified BSD License.
+
 """
 Configuration models for MCP Compose.
 
@@ -40,6 +43,7 @@ class HealthCheckMethod(str, Enum):
 class AuthProvider(str, Enum):
     """Authentication providers."""
     API_KEY = "api_key"
+    BASIC = "basic"
     JWT = "jwt"
     OAUTH2 = "oauth2"
     MTLS = "mtls"
@@ -62,6 +66,7 @@ class HttpStreamProtocol(str, Enum):
     CHUNKED = "chunked"      # HTTP chunked transfer encoding
     LINES = "lines"          # Newline-delimited JSON
     POLL = "poll"            # Long-polling
+    STREAMABLE_HTTP = "streamable-http"  # MCP native Streamable HTTP transport
 
 
 # ============================================================================
@@ -107,6 +112,12 @@ class ApiKeyAuthConfig(BaseModel):
     """API Key authentication configuration."""
     header_name: str = Field(default="X-API-Key", description="HTTP header name for API key")
     keys: List[str] = Field(default_factory=list, description="List of valid API keys")
+
+
+class BasicAuthConfig(BaseModel):
+    """Basic (username/password) authentication configuration."""
+    username: str = Field(..., description="Username for basic authentication")
+    password: str = Field(..., description="Password for basic authentication")
 
 
 class JwtAuthConfig(BaseModel):
@@ -214,6 +225,7 @@ class AuthenticationConfig(BaseModel):
     providers: List[AuthProvider] = Field(default_factory=lambda: [AuthProvider.API_KEY])
     default_provider: AuthProvider = Field(default=AuthProvider.API_KEY)
     api_key: Optional[ApiKeyAuthConfig] = Field(default=None)
+    basic: Optional[BasicAuthConfig] = Field(default=None)
     jwt: Optional[JwtAuthConfig] = Field(default=None)
     oauth2: Optional[OAuth2AuthConfig] = Field(default=None)
     mtls: Optional[MtlsAuthConfig] = Field(default=None)
@@ -300,6 +312,12 @@ class SseProxiedServerConfig(BaseModel):
     health_check_interval: int = Field(default=60, description="Health check interval in seconds")
     health_check_endpoint: Optional[str] = Field(default=None, description="Health check endpoint")
     mode: ProxyMode = Field(default=ProxyMode.PROXY, description="Proxy mode")
+    # Auto-start configuration
+    auto_start: bool = Field(default=False, description="Auto-start the server as subprocess")
+    command: Optional[List[str]] = Field(default=None, description="Command to start the server (if auto_start=true)")
+    env: Dict[str, str] = Field(default_factory=dict, description="Environment variables for auto-started server")
+    working_dir: Optional[str] = Field(default=None, description="Working directory for auto-started server")
+    startup_delay: int = Field(default=2, description="Seconds to wait after starting server")
 
 
 class HttpProxiedServerConfig(BaseModel):
@@ -321,6 +339,29 @@ class HttpProxiedServerConfig(BaseModel):
     mode: ProxyMode = Field(default=ProxyMode.PROXY, description="Proxy mode")
 
 
+class StreamableHttpProxiedServerConfig(BaseModel):
+    """Configuration for a Streamable HTTP proxied MCP server."""
+    name: str = Field(..., description="Server name")
+    url: str = Field(..., description="Streamable HTTP endpoint URL")
+    auth_token: Optional[str] = Field(default=None, description="Authentication token")
+    auth_type: str = Field(default="bearer", description="Authentication type")
+    timeout: int = Field(default=30, description="Request timeout in seconds")
+    retry_interval: int = Field(default=5, description="Retry interval in seconds")
+    keep_alive: bool = Field(default=True, description="Keep connection alive")
+    reconnect_on_failure: bool = Field(default=True, description="Reconnect on failure")
+    max_reconnect_attempts: int = Field(default=10, description="Maximum reconnection attempts")
+    health_check_enabled: bool = Field(default=False, description="Enable health checks")
+    health_check_interval: int = Field(default=60, description="Health check interval in seconds")
+    health_check_endpoint: Optional[str] = Field(default=None, description="Health check endpoint")
+    mode: ProxyMode = Field(default=ProxyMode.PROXY, description="Proxy mode")
+    # Auto-start configuration
+    auto_start: bool = Field(default=False, description="Auto-start the server as subprocess")
+    command: Optional[List[str]] = Field(default=None, description="Command to start the server (if auto_start=true)")
+    env: Dict[str, str] = Field(default_factory=dict, description="Environment variables for auto-started server")
+    working_dir: Optional[str] = Field(default=None, description="Working directory for auto-started server")
+    startup_delay: int = Field(default=2, description="Seconds to wait after starting server")
+
+
 class EmbeddedServersConfig(BaseModel):
     """Configuration for embedded servers."""
     servers: List[EmbeddedServerConfig] = Field(default_factory=list, description="List of embedded servers")
@@ -328,9 +369,12 @@ class EmbeddedServersConfig(BaseModel):
 
 class ProxiedServersConfig(BaseModel):
     """Configuration for proxied servers."""
+    model_config = {"populate_by_name": True}
+    
     stdio: List[StdioProxiedServerConfig] = Field(default_factory=list, description="STDIO proxied servers")
     sse: List[SseProxiedServerConfig] = Field(default_factory=list, description="SSE proxied servers")
     http: List[HttpProxiedServerConfig] = Field(default_factory=list, description="HTTP streaming proxied servers")
+    streamable_http: List[StreamableHttpProxiedServerConfig] = Field(default_factory=list, alias="streamable-http", description="Streamable HTTP proxied servers")
 
 
 class ServersConfig(BaseModel):
@@ -407,6 +451,7 @@ class UiConfig(BaseModel):
     framework: str = Field(default="react", description="UI framework")
     mode: str = Field(default="embedded", description="UI mode (embedded or separate)")
     path: str = Field(default="/ui", description="UI path")
+    port: int = Field(default=9456, description="UI port (when mode is 'separate')")
     static_dir: Optional[str] = Field(default=None, description="Static files directory")
     features: List[str] = Field(
         default_factory=lambda: [

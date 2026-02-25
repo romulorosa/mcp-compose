@@ -1,3 +1,6 @@
+# Copyright (c) 2025-2026 Datalayer, Inc.
+# Distributed under the terms of the Modified BSD License.
+
 # Copyright (c) 2023-2024 Datalayer, Inc.
 #
 # BSD 3-Clause License
@@ -8,7 +11,8 @@ SHELL=/bin/bash
 
 .PHONY: clean build
 
-VERSION = 0.1.0
+# Extract version from pyproject.toml
+VERSION := $(shell python -c "from mcp_compose.__version__ import __version__; print(__version__)")
 
 default: all ## default target is all
 
@@ -26,12 +30,22 @@ dev:
 test: ## run the integration tests
 	hatch test
 
-build:
+build: build-ui ## build Python package (UI is built first)
 	pip install build
 	python -m build .
 
+build-ui: ## build the UI artifacts
+	@echo "Building UI..."
+	cd ui && npm install && npm run build
+	@echo "✓ UI built successfully in ui/dist/"
+
+build-all: build-ui build ## build UI and Python package
+
 clean: ## clean
 	git clean -fdx
+
+clean-ui: ## clean UI build artifacts
+	rm -rf ui/dist ui/node_modules
 
 build-docker: ## build the docker image
 	docker buildx build --platform linux/amd64,linux/arm64 --push -t datalayer/mcp-compose:${VERSION} .
@@ -105,10 +119,25 @@ jupyterlab: ## start jupyterlab for the mcp server
 		--ServerApp.root_dir ./dev/content \
 		--IdentityProvider.token MY_TOKEN
 
-publish-pypi: # publish the pypi package
-	git clean -fdx && \
+publish-pypi: build-ui # publish the pypi package
+	git clean -fdx -e ui/dist -e ui/node_modules && \
 		python -m build
 	@exec echo
 	@exec echo twine upload ./dist/*-py3-none-any.whl
 	@exec echo
 	@exec echo https://pypi.org/project/mcp-compose/#history
+
+build-conda: build-ui ## build the conda package (requires: conda install conda-build)
+	@command -v conda-build >/dev/null 2>&1 || { echo "❌ conda-build is not installed. Run: conda install conda-build"; exit 1; }
+	git clean -fdx -e ui/dist -e ui/node_modules && \
+		VERSION=${VERSION} conda-build --output-folder ./dist/conda . -c conda-forge -c datalayer
+	@exec echo "✓ Conda package built in ./dist/conda/"
+
+publish-conda: build-conda ## build and publish the conda package to anaconda.org datalayer
+	anaconda upload --user datalayer ./dist/conda/noarch/mcp-compose-${VERSION}-*.conda
+	@exec echo
+	@exec echo "✓ Package published to anaconda.org/datalayer/mcp-compose"
+	@exec echo open https://anaconda.org/datalayer/mcp-compose
+	@exec echo
+	@exec echo "✓ Package published to anaconda.org/datalayer/mcp-compose"
+	@exec echo open https://anaconda.org/datalayer/mcp-compose

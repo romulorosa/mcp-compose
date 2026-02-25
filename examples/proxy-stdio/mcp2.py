@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 Datalayer, Inc.
+# Distributed under the terms of the Modified BSD License.
+
 """
 MCP Server 2 - Echo & String Tools
 
@@ -84,6 +87,20 @@ def count_words(text: str) -> int:
         Number of words
     """
     return len(text.split())
+
+
+@mcp.tool()
+def concatenate(strings: list[str], separator: str = " ") -> str:
+    """Concatenate an array of strings with a separator.
+    
+    Args:
+        strings: Array of strings to concatenate
+        separator: Separator to use between strings (default: space)
+        
+    Returns:
+        Concatenated string
+    """
+    return separator.join(strings)
 
 
 if __name__ == "__main__":

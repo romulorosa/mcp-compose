@@ -1,3 +1,6 @@
+# Copyright (c) 2025-2026 Datalayer, Inc.
+# Distributed under the terms of the Modified BSD License.
+
 """
 Tool and resource management endpoints.
 
@@ -56,6 +59,12 @@ async def list_tools(
     Returns:
         ToolListResponse with list of tools and pagination info.
     """
+    # Debug logging
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"composed_tools: {list(composer.composed_tools.keys())}")
+    logger.info(f"source_mapping: {composer.source_mapping}")
+    
     # Get all tool IDs
     all_tool_ids = composer.list_tools()
     

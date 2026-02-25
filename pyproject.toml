@@ -46,6 +46,11 @@ dependencies = [
 test = ["pytest>=7.0", "pytest-asyncio>=0.21.0", "pytest-cov>=4.0.0"]
 lint = ["ruff>=0.1.0", "mypy>=1.0.0"]
 dev = ["pre-commit>=3.0.0"]
+otel = [
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
+]
 
 [project.license]
 file = "LICENSE"
@@ -61,6 +66,25 @@ mcp-compose = "mcp_compose.cli:main"
 
 [tool.hatch.version]
 path = "mcp_compose/__version__.py"
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_compose"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"ui/dist" = "mcp_compose/ui/dist"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "mcp_compose",
+    "ui",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "hatch_build.py",
+]
 
 [tool.ruff]
 target-version = "py310"

@@ -1,3 +1,6 @@
+# Copyright (c) 2025-2026 Datalayer, Inc.
+# Distributed under the terms of the Modified BSD License.
+
 .PHONY: help install install-agent start agent stop clean
 
 # Default target
@@ -55,9 +58,7 @@ install-agent:
 start:
 	@echo "Starting MCP Compose with Streamable HTTP transport..."
 	@echo ""
-	@echo "📡 Server will be available at: http://localhost:8080/mcp"
-	@echo ""
-	mcp-compose serve --config mcp_compose.toml --transport streamable-http
+	mcp-compose -v serve --config mcp_compose.toml --transport streamable-http
 
 # Run the AI agent
 agent:

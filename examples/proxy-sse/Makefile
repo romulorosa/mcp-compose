@@ -1,3 +1,6 @@
+# Copyright (c) 2025-2026 Datalayer, Inc.
+# Distributed under the terms of the Modified BSD License.
+
 .PHONY: help install install-agent start agent stop clean
 
 # Default target
@@ -62,7 +65,7 @@ start:
 	@echo "⚠️  Note: SSE transport is deprecated."
 	@echo "   Consider using proxy-streamable-http instead."
 	@echo ""
-	@echo "📡 Server will be available at: http://localhost:8080/sse"
+	@echo "📡 Server endpoint will be shown below..."
 	@echo ""
 	mcp-compose serve --config mcp_compose.toml --transport sse
 
